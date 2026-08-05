@@ -2470,6 +2470,7 @@ mod tests {
                         ),
                     ),
                     tiled_state: None,
+                    force_render: None,
                     background_effect: BackgroundEffectRule {
                         xray: None,
                         blur: None,
