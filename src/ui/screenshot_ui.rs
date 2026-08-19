@@ -2,10 +2,8 @@ use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::f64::consts::TAU;
-use std::iter::zip;
 use std::rc::Rc;
 
-use anyhow::Context;
 use arrayvec::ArrayVec;
 use niri_config::{Action, Bind, BoundAction, Config, Key, Modifiers, Trigger};
 use niri_ipc::SizeChange;
@@ -16,7 +14,7 @@ use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::renderer::{ExportMem, Texture as _};
+use smithay::backend::renderer::Texture as _;
 use smithay::input::keyboard::Keysym;
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
@@ -27,8 +25,10 @@ use crate::niri_render_elements;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::{render_to_texture, RenderTarget};
+use crate::render_helpers::view::ViewElement;
+use crate::render_helpers::{render_to_vec, RenderTarget};
 use crate::utils::to_physical_precise_round;
+use crate::utils::view::OutputViewport;
 
 const SELECTION_BORDER: i32 = 2;
 
@@ -57,6 +57,7 @@ pub enum ScreenshotUi {
     },
     Open {
         selection: (Output, Point<i32, Physical>, Point<i32, Physical>),
+        touch_selection_checkpoint: Option<(Output, Point<i32, Physical>, Point<i32, Physical>)>,
         output_data: HashMap<Output, OutputData>,
         button: Button,
         show_pointer: bool,
@@ -93,20 +94,67 @@ pub struct OutputData {
     // Output, screencast, screen capture.
     screenshot: [OutputScreenshot; 3],
     buffers: [SolidColorBuffer; 8],
-    locations: [Point<i32, Physical>; 8],
     panel: Option<(TextureBuffer<GlesTexture>, TextureBuffer<GlesTexture>)>,
 }
 
 pub struct OutputScreenshot {
-    texture: GlesTexture,
     buffer: PrimaryGpuTextureRenderElement,
-    pointer: Option<PrimaryGpuTextureRenderElement>,
+    pointer: Option<ScreenshotPointer>,
+    capture_level: f64,
+}
+
+#[derive(Clone)]
+struct ScreenshotPointer {
+    element: PrimaryGpuTextureRenderElement,
+    hotspot: Point<i32, Physical>,
+    tip: Point<i32, Physical>,
+}
+
+impl ScreenshotPointer {
+    fn view_element(
+        &self,
+        view: OutputViewport,
+        scale: Scale<f64>,
+        capture_level: f64,
+        ignore_view_scale: bool,
+    ) -> ViewElement<PrimaryGpuTextureRenderElement> {
+        let element_factor = if ignore_view_scale {
+            view.factor / capture_level
+        } else {
+            view.factor
+        };
+        let element_view = OutputViewport::new(view.focal, element_factor);
+        let tip = view
+            .content_to_screen(self.tip.to_f64().to_logical(scale))
+            .to_physical_precise_round(scale);
+        let hotspot = self
+            .hotspot
+            .to_f64()
+            .upscale(element_view.factor)
+            .to_i32_round();
+
+        ViewElement::from_element(
+            self.element.clone(),
+            element_view,
+            scale,
+            Some(tip - hotspot),
+        )
+    }
+}
+
+niri_render_elements! {
+    ScreenshotChrome => {
+        Texture = PrimaryGpuTextureRenderElement,
+    }
 }
 
 niri_render_elements! {
     ScreenshotUiRenderElement => {
         Screenshot = PrimaryGpuTextureRenderElement,
+        ViewScreenshot = ViewElement<PrimaryGpuTextureRenderElement>,
+        ViewSolidColor = ViewElement<SolidColorRenderElement>,
         SolidColor = SolidColorRenderElement,
+        Chrome = ScreenshotChrome,
     }
 }
 
@@ -200,7 +248,6 @@ impl ScreenshotUi {
                     SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.5]),
                     SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.5]),
                 ];
-                let locations = [Default::default(); 8];
 
                 let mut render_panel_ = |text| {
                     render_panel(renderer, scale, text)
@@ -217,7 +264,6 @@ impl ScreenshotUi {
                     transform,
                     screenshot,
                     buffers,
-                    locations,
                     panel,
                 };
                 (output, data)
@@ -231,6 +277,7 @@ impl ScreenshotUi {
 
         *self = Self::Open {
             selection,
+            touch_selection_checkpoint: None,
             output_data,
             button: Button::Up,
             show_pointer,
@@ -561,7 +608,6 @@ impl ScreenshotUi {
 
         for (output, data) in output_data {
             let buffers = &mut data.buffers;
-            let locations = &mut data.locations;
             let size = data.size;
             let scale = data.scale;
 
@@ -576,35 +622,13 @@ impl ScreenshotUi {
                     *b = rect.loc + rect.size - Size::from((1, 1));
                 }
 
-                let border = to_physical_precise_round(scale, SELECTION_BORDER);
+                let border_px = to_physical_precise_round(scale, SELECTION_BORDER);
+                let border = Rectangle::from_size(Size::from((border_px, border_px)));
+                let layout = selection_layout(rect, border, size);
 
-                let resize = move |buffer: &mut SolidColorBuffer, w: i32, h: i32| {
-                    let size = Size::<_, Physical>::from((w, h));
-                    buffer.resize(size.to_f64().to_logical(scale));
-                };
-
-                resize(&mut buffers[0], rect.size.w + border * 2, border);
-                resize(&mut buffers[1], rect.size.w + border * 2, border);
-                resize(&mut buffers[2], border, rect.size.h);
-                resize(&mut buffers[3], border, rect.size.h);
-
-                resize(&mut buffers[4], size.w, rect.loc.y);
-                resize(&mut buffers[5], size.w, size.h - rect.loc.y - rect.size.h);
-                resize(&mut buffers[6], rect.loc.x, rect.size.h);
-                resize(
-                    &mut buffers[7],
-                    size.w - rect.loc.x - rect.size.w,
-                    rect.size.h,
-                );
-
-                locations[0] = Point::from((rect.loc.x - border, rect.loc.y - border));
-                locations[1] = Point::from((rect.loc.x - border, rect.loc.y + rect.size.h));
-                locations[2] = Point::from((rect.loc.x - border, rect.loc.y));
-                locations[3] = Point::from((rect.loc.x + rect.size.w, rect.loc.y));
-
-                locations[5] = Point::from((0, rect.loc.y + rect.size.h));
-                locations[6] = Point::from((0, rect.loc.y));
-                locations[7] = Point::from((rect.loc.x + rect.size.w, rect.loc.y));
+                for (buffer, layout_rect) in buffers.iter_mut().zip(layout.iter()) {
+                    buffer.resize(layout_rect.size.to_f64().to_logical(scale));
+                }
             } else {
                 buffers[0].resize((0., 0.));
                 buffers[1].resize((0., 0.));
@@ -623,14 +647,17 @@ impl ScreenshotUi {
         &self,
         output: &Output,
         target: RenderTarget,
+        view: OutputViewport,
         push: &mut dyn FnMut(ScreenshotUiRenderElement),
     ) {
         let _span = tracy_client::span!("ScreenshotUi::render_output");
 
         let Self::Open {
+            selection,
             output_data,
             show_pointer,
             button,
+            config,
             open_anim,
             ..
         } = self
@@ -644,6 +671,7 @@ impl ScreenshotUi {
 
         let scale = output_data.scale;
         let progress = open_anim.clamped_value().clamp(0., 1.) as f32;
+        let ignore_view_scale = config.borrow().cursor.ignore_view_scale;
 
         // The help panel goes on top.
         if let Some((show, hide)) = &output_data.panel {
@@ -657,24 +685,39 @@ impl ScreenshotUi {
                 .to_f64()
                 .to_logical(scale);
 
-            let elem = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-                buffer.clone(),
-                location,
-                alpha * progress,
-                None,
-                None,
-                Kind::Unspecified,
+            let elem = ScreenshotChrome::Texture(PrimaryGpuTextureRenderElement(
+                TextureRenderElement::from_texture_buffer(
+                    buffer.clone(),
+                    location,
+                    alpha * progress,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ),
             ));
             push(elem.into());
         }
 
-        for (buffer, loc) in zip(&output_data.buffers, &output_data.locations) {
-            let elem = SolidColorRenderElement::from_buffer(
-                buffer,
-                loc.to_f64().to_logical(scale),
-                progress,
-                Kind::Unspecified,
-            );
+        let layout = if output == &selection.0 {
+            let size = output_data.size;
+            let rect = rect_from_corner_points(selection.1, selection.2);
+            let border_px = to_physical_precise_round(scale, SELECTION_BORDER);
+            let border = Rectangle::from_size(Size::from((border_px, border_px)));
+            Some(selection_layout(rect, border, size))
+        } else {
+            None
+        };
+
+        for (index, buffer) in output_data.buffers.iter().enumerate() {
+            let location = if let Some(layout) = &layout {
+                layout[index].to_f64().to_logical(scale).loc
+            } else {
+                (0., 0.).into()
+            };
+            let elem =
+                SolidColorRenderElement::from_buffer(buffer, location, progress, Kind::Unspecified);
+            let elem = ViewElement::from_element(elem, view, Scale::from(scale), None);
+
             push(elem.into());
         }
 
@@ -686,17 +729,17 @@ impl ScreenshotUi {
         };
         let screenshot = &output_data.screenshot[index];
 
-        if *show_pointer {
-            if let Some(pointer) = screenshot.pointer.clone() {
-                push(pointer.into());
-            }
+        for element in
+            screenshot.content_elements(view, scale.into(), ignore_view_scale, *show_pointer)
+        {
+            push(element);
         }
-        push(screenshot.buffer.clone().into());
     }
 
     pub fn capture(
         &self,
         renderer: &mut GlesRenderer,
+        view: OutputViewport,
     ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
         let _span = tracy_client::span!("ScreenshotUi::capture");
 
@@ -704,6 +747,7 @@ impl ScreenshotUi {
             selection,
             output_data,
             show_pointer,
+            config,
             ..
         } = self
         else {
@@ -711,57 +755,37 @@ impl ScreenshotUi {
         };
 
         let data = &output_data[&selection.0];
-        let rect = rect_from_corner_points(selection.1, selection.2);
+        let content_rect = rect_from_corner_points(selection.1, selection.2);
+        let display_rect = view
+            .content_to_screen_rect(content_rect.to_f64().to_logical(data.scale))
+            .to_physical(data.scale)
+            .to_i32_round();
+        anyhow::ensure!(
+            !display_rect.size.is_empty(),
+            "screenshot selection is empty after zoom mapping"
+        );
 
         let screenshot = &data.screenshot[0];
+        let elements = screenshot.content_elements(
+            view,
+            data.scale.into(),
+            config.borrow().cursor.ignore_view_scale,
+            *show_pointer,
+        );
+        let offset = display_rect.loc.upscale(-1);
+        let elements = elements.iter().rev().map(|element| {
+            RelocateRenderElement::from_element(element, offset, Relocate::Relative)
+        });
+        let pixels = render_to_vec(
+            renderer,
+            display_rect.size,
+            data.scale.into(),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            elements,
+        )?;
 
-        // Composite the pointer on top if needed.
-        let mut tex_rect = None;
-        if *show_pointer {
-            if let Some(pointer) = screenshot.pointer.clone() {
-                let scale = pointer.0.buffer().texture_scale();
-                let offset = rect.loc.upscale(-1);
-
-                let mut elements = ArrayVec::<_, 2>::new();
-                elements.push(pointer);
-                elements.push(screenshot.buffer.clone());
-                let elements = elements.iter().rev().map(|elem| {
-                    RelocateRenderElement::from_element(elem, offset, Relocate::Relative)
-                });
-
-                let res = render_to_texture(
-                    renderer,
-                    rect.size,
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    elements,
-                );
-                match res {
-                    Ok((texture, _)) => {
-                        tex_rect = Some((texture, Rectangle::from_size(rect.size)));
-                    }
-                    Err(err) => {
-                        warn!("error compositing pointer onto screenshot: {err:?}");
-                    }
-                }
-            }
-        }
-
-        let (texture, rect) = tex_rect.unwrap_or_else(|| (screenshot.texture.clone(), rect));
-        // The size doesn't actually matter because we're not transforming anything.
-        let buf_rect = rect
-            .to_logical(1)
-            .to_buffer(1, Transform::Normal, &Size::from((1, 1)));
-
-        let mapping = renderer
-            .copy_texture(&texture, buf_rect, Fourcc::Abgr8888)
-            .context("error copying texture")?;
-        let copy = renderer
-            .map_texture(&mapping)
-            .context("error mapping texture")?;
-
-        Ok((rect.size, copy.to_vec()))
+        Ok((display_rect.size, pixels))
     }
 
     pub fn binds(&self) -> impl Iterator<Item = &Bind> + Clone {
@@ -850,6 +874,40 @@ impl ScreenshotUi {
         }
     }
 
+    pub fn rollback_touch_interaction(&mut self) {
+        let restored = if let Self::Open {
+            selection,
+            touch_selection_checkpoint,
+            button,
+            ..
+        } = self
+        {
+            if let Some(previous) = touch_selection_checkpoint.take() {
+                *selection = previous;
+                *button = Button::Up;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if restored {
+            self.update_buffers();
+        }
+    }
+
+    pub fn finish_touch_sequence(&mut self) {
+        if let Self::Open {
+            touch_selection_checkpoint,
+            ..
+        } = self
+        {
+            *touch_selection_checkpoint = None;
+        }
+    }
+
     pub fn output_size(&self, output: &Output) -> Option<(Size<i32, Physical>, f64, Transform)> {
         if let Self::Open { output_data, .. } = self {
             let data = output_data.get(output)?;
@@ -917,6 +975,7 @@ impl ScreenshotUi {
     ) -> bool {
         let Self::Open {
             selection,
+            touch_selection_checkpoint,
             output_data,
             show_pointer,
             button,
@@ -926,15 +985,25 @@ impl ScreenshotUi {
             return false;
         };
 
+        if slot.is_some() && touch_selection_checkpoint.is_none() {
+            *touch_selection_checkpoint = Some(selection.clone());
+        }
+
         // Check if this is a second touch (different slot) while already dragging.
         if let Some(new_slot) = slot {
             if let Button::Down {
+                touch_slot,
                 on_capture_button: false,
                 move_state,
                 last_pos,
                 ..
             } = button
             {
+                if *touch_slot != Some(new_slot) {
+                    // Keep the first finger's selection change, but discard UI movement after
+                    // the second contact is claimed as a zoom gesture.
+                    *touch_selection_checkpoint = Some(selection.clone());
+                }
                 if move_state.is_none() {
                     *move_state = Some(MoveState {
                         pointer_offset: last_pos.1 - selection.1,
@@ -1086,17 +1155,12 @@ impl OutputScreenshot {
     pub fn from_textures(
         renderer: &mut GlesRenderer,
         scale: Scale<f64>,
+        capture_level: f64,
         texture: GlesTexture,
-        pointer: Option<(GlesTexture, Rectangle<i32, Physical>)>,
+        pointer: Option<(GlesTexture, Rectangle<i32, Physical>, Point<i32, Physical>)>,
     ) -> Self {
         let buffer = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-            TextureBuffer::from_texture(
-                renderer,
-                texture.clone(),
-                scale,
-                Transform::Normal,
-                Vec::new(),
-            ),
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new()),
             (0., 0.),
             1.,
             None,
@@ -1104,28 +1168,55 @@ impl OutputScreenshot {
             Kind::Unspecified,
         ));
 
-        let pointer = pointer.map(|(texture, geo)| {
-            PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-                TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    Vec::new(),
-                ),
-                geo.to_f64().to_logical(scale).loc,
-                1.,
-                None,
-                None,
-                Kind::Unspecified,
-            ))
+        let pointer = pointer.map(|(texture, geo, tip)| {
+            let element =
+                PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
+                    TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        Vec::new(),
+                    ),
+                    geo.to_f64().to_logical(scale).loc,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
+            ScreenshotPointer {
+                element,
+                hotspot: tip - geo.loc,
+                tip,
+            }
         });
 
         Self {
-            texture,
             buffer,
             pointer,
+            capture_level,
         }
+    }
+
+    fn content_elements(
+        &self,
+        view: OutputViewport,
+        scale: Scale<f64>,
+        ignore_view_scale: bool,
+        show_pointer: bool,
+    ) -> ArrayVec<ScreenshotUiRenderElement, 2> {
+        let mut elements = ArrayVec::new();
+        if show_pointer {
+            if let Some(pointer) = &self.pointer {
+                elements.push(
+                    pointer
+                        .view_element(view, scale, self.capture_level, ignore_view_scale)
+                        .into(),
+                );
+            }
+        }
+        elements.push(ViewElement::from_element(self.buffer.clone(), view, scale, None).into());
+        elements
     }
 }
 
@@ -1140,6 +1231,55 @@ pub fn rect_from_corner_points(
     // We're adding + 1 because the pointer is clamped to output size - 1, so to get the full
     // screen worth of selection we must add back that + 1.
     Rectangle::from_extremities((x1, y1), (x2 + 1, y2 + 1))
+}
+
+fn selection_layout(
+    rect: Rectangle<i32, Physical>,
+    border: Rectangle<i32, Physical>,
+    size: Size<i32, Physical>,
+) -> [Rectangle<i32, Physical>; 8] {
+    let mut layout = [Default::default(); 8];
+
+    // Top border
+    layout[0] = Rectangle::new(
+        Point::from((rect.loc.x - border.size.w, rect.loc.y - border.size.h)),
+        Size::from((rect.size.w + border.size.w * 2, border.size.h)),
+    );
+    // Bottom border
+    layout[1] = Rectangle::new(
+        Point::from((rect.loc.x - border.size.w, rect.loc.y + rect.size.h)),
+        Size::from((rect.size.w + border.size.w * 2, border.size.h)),
+    );
+    // Left border
+    layout[2] = Rectangle::new(
+        Point::from((rect.loc.x - border.size.w, rect.loc.y)),
+        Size::from((border.size.w, rect.size.h)),
+    );
+    // Right border
+    layout[3] = Rectangle::new(
+        Point::from((rect.loc.x + rect.size.w, rect.loc.y)),
+        Size::from((border.size.w, rect.size.h)),
+    );
+
+    // Top overlay
+    layout[4] = Rectangle::new(Point::from((0, 0)), Size::from((size.w, rect.loc.y)));
+    // Bottom overlay
+    layout[5] = Rectangle::new(
+        Point::from((0, rect.loc.y + rect.size.h)),
+        Size::from((size.w, size.h - (rect.loc.y + rect.size.h))),
+    );
+    // Left overlay
+    layout[6] = Rectangle::new(
+        Point::from((0, rect.loc.y)),
+        Size::from((rect.loc.x, rect.size.h)),
+    );
+    // Right overlay
+    layout[7] = Rectangle::new(
+        Point::from((rect.loc.x + rect.size.w, rect.loc.y)),
+        Size::from((size.w - (rect.loc.x + rect.size.w), rect.size.h)),
+    );
+
+    layout
 }
 
 fn panel_location(output_data: &OutputData, panel_size: Size<i32, Buffer>) -> Point<i32, Physical> {
