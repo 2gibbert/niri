@@ -2445,6 +2445,7 @@ mod tests {
                     clip_to_geometry: None,
                     baba_is_float: None,
                     block_out_from: None,
+                    allow_tearing: None,
                     variable_refresh_rate: Some(
                         FullscreenOnly,
                     ),
@@ -2970,6 +2971,7 @@ mod tests {
                 skip_cursor_only_updates_during_vrr: false,
                 disable_10bit_output: false,
                 nested_show_host_cursor: false,
+                force_tearing: false,
             },
             workspaces: [
                 Workspace {
