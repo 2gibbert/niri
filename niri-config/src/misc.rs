@@ -79,7 +79,7 @@ impl MergeWith<ZoomPart> for Zoom {
 #[derive(Debug, PartialEq)]
 pub struct Cursor {
     pub xcursor_theme: String,
-    pub xcursor_size: u8,
+    pub xcursor_size: u16,
     pub hide_when_typing: bool,
     pub hide_after_inactive_ms: Option<u32>,
     pub ignore_view_scale: bool,
@@ -102,7 +102,7 @@ pub struct CursorPart {
     #[knuffel(child, unwrap(argument))]
     pub xcursor_theme: Option<String>,
     #[knuffel(child, unwrap(argument))]
-    pub xcursor_size: Option<u8>,
+    pub xcursor_size: Option<u16>,
     #[knuffel(child)]
     pub hide_when_typing: Option<Flag>,
     #[knuffel(child, unwrap(argument))]
